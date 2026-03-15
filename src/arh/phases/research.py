@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ..io import load_prompt, render_prompt, request_structured
+from ..io import load_prompt, render_prompt, request_discussion_then_structured
 from ..opencode import create_session, start_server, stop_process, wait_for_health
 from ..results import (
     append_research_row,
@@ -29,6 +29,13 @@ def build_plan_prompt(contract_markdown: str, results_markdown: str) -> str:
         template,
         contract_markdown=contract_markdown,
         results_markdown=results_markdown,
+    )
+
+
+def build_finalize_prompt(task_name: str) -> str:
+    return (
+        f"Based on the discussion so far, return only the final structured {task_name}. "
+        "Do not ask follow-up questions. Do not include prose outside the structured result."
     )
 
 
@@ -267,14 +274,16 @@ def run(
         if not isinstance(session_id, str) or not session_id:
             raise RuntimeError(f"failed to extract session id from response: {session}")
 
-        plan = request_structured(
+        plan = request_discussion_then_structured(
             base_url=base_url,
             session_id=session_id,
-            prompt=build_plan_prompt(contract_markdown, results_markdown),
+            discussion_prompt=build_plan_prompt(contract_markdown, results_markdown),
+            finalize_prompt=build_finalize_prompt("research plan"),
             model_type=ResearchPlan,
             model=model,
             verbose=verbose,
-            status_hint="Planning next experiment...",
+            discussion_status_hint="Planning next experiment...",
+            finalize_status_hint="Structuring experiment plan...",
         )
 
         patch_result: ResearchPatchResult | None = None
@@ -287,20 +296,22 @@ def run(
             if tmux_session_exists(session_name, cwd):
                 kill_tmux_session(session_name, cwd)
 
-            patch_result = request_structured(
+            patch_result = request_discussion_then_structured(
                 base_url=base_url,
                 session_id=session_id,
-                prompt=build_patch_prompt(
+                discussion_prompt=build_patch_prompt(
                     contract_markdown,
                     results_markdown,
                     plan,
                     patch_result,
                     log_tail,
                 ),
+                finalize_prompt=build_finalize_prompt("research patch result"),
                 model_type=ResearchPatchResult,
                 model=model,
                 verbose=verbose,
-                status_hint="Preparing experiment changes...",
+                discussion_status_hint="Preparing experiment changes...",
+                finalize_status_hint="Structuring experiment patch...",
             )
 
             if patch_result.status == "needs_user_action":

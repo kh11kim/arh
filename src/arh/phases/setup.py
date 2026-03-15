@@ -3,16 +3,20 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ..io import load_prompt, render_prompt, request_structured
+import typer
+
+from .. import io
 from ..opencode import create_session, start_server, stop_process, wait_for_health
 from ..schema import (
     DEFAULT_RESEARCH_MD,
     ContractState,
     SmokeInspection,
+    SetupPreparation,
     SetupPatchResult,
     load_contract_markdown,
     sanitize_model_text,
@@ -25,6 +29,7 @@ START_PREFIX = "ARH_RUN_START"
 
 def sanitize_user_input(text: str) -> str:
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", cleaned)
     return cleaned.strip()
 
 
@@ -48,33 +53,58 @@ def parse_duration_seconds(value: str) -> int:
     return amount * 3600
 
 
-def build_inspect_prompt(
-    contract_markdown: str,
-    current_inspection: SmokeInspection,
-    user_message: str,
-) -> str:
-    template = load_prompt("setup_inspect.md")
-    return render_prompt(
+def build_inspect_discussion_prompt(contract_markdown: str, user_message: str) -> str:
+    template = io.load_prompt("setup_inspect_discussion.md")
+    return io.render_prompt(
         template,
         contract_markdown=contract_markdown,
-        current_inspection_json=current_inspection.model_dump_json(indent=2),
         user_message=user_message.strip(),
+    )
+
+
+def build_inspect_finalize_prompt(contract_markdown: str) -> str:
+    template = io.load_prompt("setup_inspect_finalize.md")
+    return io.render_prompt(template, contract_markdown=contract_markdown)
+
+
+def build_prepare_discussion_prompt(
+    contract_markdown: str, inspection: SmokeInspection, user_message: str
+) -> str:
+    template = io.load_prompt("setup_prepare_discussion.md")
+    return io.render_prompt(
+        template,
+        contract_markdown=contract_markdown,
+        inspection_json=inspection.model_dump_json(indent=2),
+        user_message=user_message.strip(),
+    )
+
+
+def build_prepare_finalize_prompt(
+    contract_markdown: str, inspection: SmokeInspection
+) -> str:
+    template = io.load_prompt("setup_prepare_finalize.md")
+    return io.render_prompt(
+        template,
+        contract_markdown=contract_markdown,
+        inspection_json=inspection.model_dump_json(indent=2),
     )
 
 
 def build_patch_prompt(
     contract_markdown: str,
     inspection: SmokeInspection,
+    preparation: SetupPreparation,
     run_label: str,
     metric_tag: str,
     previous_patch_result: SetupPatchResult | None,
     log_tail: str,
 ) -> str:
-    template = load_prompt("setup_patch.md")
-    return render_prompt(
+    template = io.load_prompt("setup_patch.md")
+    return io.render_prompt(
         template,
         contract_markdown=contract_markdown,
         inspection_json=inspection.model_dump_json(indent=2),
+        preparation_json=preparation.model_dump_json(indent=2),
         run_label=str(run_label),
         metric_tag=metric_tag,
         previous_patch_json=(
@@ -87,17 +117,29 @@ def build_patch_prompt(
 
 
 def print_inspection(inspection: SmokeInspection) -> None:
+    def print_list(title: str, items: list[str]) -> None:
+        print(f"- {title}:")
+        for item in items or ["(not set)"]:
+            print(f"  {item}")
+
     print("\nSmoke inspection:\n")
     print(f"- entrypoint: {inspection.entrypoint or '(not set)'}")
-    print("- file_tree:")
-    for item in inspection.file_tree or ["(not set)"]:
+    print_list("file_tree", inspection.file_tree)
+    print_list("key_files", inspection.key_files)
+    print(f"- experiment_summary: {inspection.model_summary or '(not set)'}")
+    print_list("modifiable_scope", inspection.modifiable_files)
+    print_list("tunable_scope", inspection.modifiable_parameters)
+    print()
+
+
+def print_preparation(preparation: SetupPreparation) -> None:
+    print("\nSmoke preparation:\n")
+    print(f"- summary: {preparation.preparation_summary or '(not set)'}")
+    print("- changed_files:")
+    for item in preparation.changed_files or ["(not set)"]:
         print(f"  {item}")
-    print("- key_files:")
-    for item in inspection.key_files or ["(not set)"]:
-        print(f"  {item}")
-    print(f"- model: {inspection.model_summary or '(not set)'}")
-    print(f"- files: {', '.join(inspection.modifiable_files) or '(not set)'}")
-    print(f"- parameters: {', '.join(inspection.modifiable_parameters) or '(not set)'}")
+    print(f"- smoke_command: {preparation.smoke_command or '(not set)'}")
+    print(f"- patch_plan: {preparation.patch_plan or '(not set)'}")
     print()
 
 
@@ -106,24 +148,84 @@ def request_inspection(
     base_url: str,
     session_id: str,
     contract_markdown: str,
-    current_inspection: SmokeInspection,
     user_message: str,
     model: str | None,
     verbose: bool,
-) -> SmokeInspection:
-    prompt = build_inspect_prompt(
-        contract_markdown=contract_markdown,
-        current_inspection=current_inspection,
-        user_message=user_message,
+) -> str:
+    prompt = build_inspect_discussion_prompt(
+        contract_markdown=contract_markdown, user_message=user_message
     )
-    return request_structured(
+    return io.request_text(
         base_url=base_url,
         session_id=session_id,
         prompt=prompt,
+        model=model,
+        verbose=verbose,
+        status_hint="Discussing training inspection...",
+    )
+
+
+def finalize_inspection(
+    *,
+    base_url: str,
+    session_id: str,
+    contract_markdown: str,
+    model: str | None,
+    verbose: bool,
+) -> SmokeInspection:
+    return io.request_structured(
+        base_url=base_url,
+        session_id=session_id,
+        prompt=build_inspect_finalize_prompt(contract_markdown),
         model_type=SmokeInspection,
         model=model,
         verbose=verbose,
-        status_hint="Inspecting training code...",
+        status_hint="Finalizing training inspection...",
+    )
+
+
+def request_preparation(
+    *,
+    base_url: str,
+    session_id: str,
+    contract_markdown: str,
+    inspection: SmokeInspection,
+    user_message: str,
+    model: str | None,
+    verbose: bool,
+) -> str:
+    prompt = build_prepare_discussion_prompt(
+        contract_markdown=contract_markdown,
+        inspection=inspection,
+        user_message=user_message,
+    )
+    return io.request_text(
+        base_url=base_url,
+        session_id=session_id,
+        prompt=prompt,
+        model=model,
+        verbose=verbose,
+        status_hint="Discussing smoke preparation...",
+    )
+
+
+def finalize_preparation(
+    *,
+    base_url: str,
+    session_id: str,
+    contract_markdown: str,
+    inspection: SmokeInspection,
+    model: str | None,
+    verbose: bool,
+) -> SetupPreparation:
+    return io.request_structured(
+        base_url=base_url,
+        session_id=session_id,
+        prompt=build_prepare_finalize_prompt(contract_markdown, inspection),
+        model_type=SetupPreparation,
+        model=model,
+        verbose=verbose,
+        status_hint="Finalizing smoke preparation...",
     )
 
 
@@ -133,6 +235,7 @@ def request_patch(
     session_id: str,
     contract_markdown: str,
     inspection: SmokeInspection,
+    preparation: SetupPreparation,
     run_label: str,
     metric_tag: str,
     previous_patch_result: SetupPatchResult | None,
@@ -143,12 +246,13 @@ def request_patch(
     prompt = build_patch_prompt(
         contract_markdown=contract_markdown,
         inspection=inspection,
+        preparation=preparation,
         run_label=run_label,
         metric_tag=metric_tag,
         previous_patch_result=previous_patch_result,
         log_tail=log_tail,
     )
-    return request_structured(
+    return io.request_structured(
         base_url=base_url,
         session_id=session_id,
         prompt=prompt,
@@ -225,14 +329,33 @@ def run_smoke_command(
     timeout_seconds: int,
     metric_tag: str,
 ) -> dict[str, object]:
+    resolved_command = command
+    local_python = cwd / ".venv" / "bin" / "python"
+    local_python3 = cwd / ".venv" / "bin" / "python3"
+    if local_python.exists():
+        current_python = str(local_python)
+    elif local_python3.exists():
+        current_python = str(local_python3)
+    else:
+        current_python = sys.executable
+    command_match = re.match(
+        r"^((?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*)((?:python3|python))\s+(.*)$",
+        command,
+    )
+    if command_match:
+        env_prefix, _, remainder = command_match.groups()
+        resolved_command = f'{env_prefix}"{current_python}" {remainder}'
+
     temp_log_path = logs_dir(cwd) / "setup_smoke_pending.log"
     with temp_log_path.open("w", encoding="utf-8") as log_handle:
         env = os.environ.copy()
         env["ARH_EXP_NUM"] = str(run_label)
         env["ARH_METRIC_TAG"] = metric_tag
         env["ARH_SMOKE"] = "1"
+        python_bin = str(Path(current_python).parent)
+        env["PATH"] = python_bin + os.pathsep + env.get("PATH", "")
         process = subprocess.Popen(
-            command,
+            resolved_command,
             cwd=str(cwd),
             shell=True,
             stdout=log_handle,
@@ -260,7 +383,7 @@ def run_smoke_command(
             log_handle.write("\nARH_RESULT status=timeout\n")
 
     return {
-        "command": command,
+        "command": resolved_command,
         "log_path": str(final_log_path),
         "pid": process.pid,
         "exit_code": exit_code,
@@ -370,22 +493,23 @@ def run(
 
         print("OpenCode setup session started.")
 
-        inspection = SmokeInspection()
         user_message = (
-            "Inspect the training entrypoint and prepare a minimal smoke setup plan."
+            "Inspect the training entrypoint and summarize the setup context."
         )
         while True:
-            inspection = request_inspection(
-                base_url=base_url,
-                session_id=session_id,
-                contract_markdown=contract_markdown,
-                current_inspection=inspection,
-                user_message=user_message,
-                model=model,
-                verbose=verbose,
-            )
-            print_inspection(inspection)
-            print(inspection.next_question)
+            try:
+                reply = request_inspection(
+                    base_url=base_url,
+                    session_id=session_id,
+                    contract_markdown=contract_markdown,
+                    user_message=user_message,
+                    model=model,
+                    verbose=verbose,
+                )
+            except io.StructuredResponseError as exc:
+                typer.secho(str(exc), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            print(reply)
             try:
                 user_input = sanitize_user_input(input("> "))
             except EOFError:
@@ -393,11 +517,77 @@ def run(
 
             if user_input.lower() == "quit":
                 return {"status": "cancelled", "session_id": session_id}
-            if inspection.ready_for_confirmation and user_input.lower() == "confirm":
-                break
+            if user_input.lower() == "confirm":
+                inspection = finalize_inspection(
+                    base_url=base_url,
+                    session_id=session_id,
+                    contract_markdown=contract_markdown,
+                    model=model,
+                    verbose=verbose,
+                )
+                print_inspection(inspection)
+                if inspection.ready_for_confirmation:
+                    break
+                print(inspection.next_question)
+                try:
+                    user_message = sanitize_user_input(input("> "))
+                except EOFError:
+                    user_message = "quit"
+                if user_message.lower() == "quit":
+                    return {"status": "cancelled", "session_id": session_id}
+                continue
             user_message = user_input or "Please continue."
 
         inspection = sanitize_inspection(inspection)
+        print_inspection(inspection)
+
+        user_message = (
+            "Prepare the minimal smoke patch plan based on the confirmed inspection."
+        )
+        while True:
+            try:
+                reply = request_preparation(
+                    base_url=base_url,
+                    session_id=session_id,
+                    contract_markdown=contract_markdown,
+                    inspection=inspection,
+                    user_message=user_message,
+                    model=model,
+                    verbose=verbose,
+                )
+            except io.StructuredResponseError as exc:
+                typer.secho(str(exc), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=1)
+            print(reply)
+            try:
+                user_input = sanitize_user_input(input("> "))
+            except EOFError:
+                user_input = "quit"
+
+            if user_input.lower() == "quit":
+                return {"status": "cancelled", "session_id": session_id}
+            if user_input.lower() == "confirm":
+                preparation = finalize_preparation(
+                    base_url=base_url,
+                    session_id=session_id,
+                    contract_markdown=contract_markdown,
+                    inspection=inspection,
+                    model=model,
+                    verbose=verbose,
+                )
+                print_preparation(preparation)
+                if preparation.ready_for_confirmation:
+                    break
+                print(preparation.next_question)
+                try:
+                    user_message = sanitize_user_input(input("> "))
+                except EOFError:
+                    user_message = "quit"
+                if user_message.lower() == "quit":
+                    return {"status": "cancelled", "session_id": session_id}
+                continue
+            user_message = user_input or "Please continue."
+
         update_contract_with_inspection(contract_file, inspection)
         contract_markdown = contract_file.read_text(encoding="utf-8", errors="ignore")
         run_label = "setup"
@@ -413,6 +603,7 @@ def run(
                 session_id=session_id,
                 contract_markdown=contract_markdown,
                 inspection=inspection,
+                preparation=preparation,
                 run_label=run_label,
                 metric_tag=contract.evaluation.main_metric,
                 previous_patch_result=patch_result,
@@ -431,7 +622,7 @@ def run(
                 f"- changed_files: {', '.join(patch_result.changed_files) or '(none reported)'}"
             )
 
-            if patch_result.status == "needs_user_action":
+            if patch_result.status == "needs_user_action" and smoke_result is not None:
                 print("\nUser action is required.")
                 print(f"- summary: {patch_result.summary or '(none)'}")
                 print(f"- action: {patch_result.user_action or '(none)'}")
@@ -444,9 +635,11 @@ def run(
                 }
 
             changed_files.extend(patch_result.changed_files)
+            print("\nRunning smoke command...")
+            print(f"- command: {preparation.smoke_command}")
             smoke_result = run_smoke_command(
                 cwd=cwd,
-                command=inspection.smoke_command,
+                command=preparation.smoke_command,
                 run_label=run_label,
                 timeout_seconds=parse_duration_seconds(
                     contract.execution.experiment_time

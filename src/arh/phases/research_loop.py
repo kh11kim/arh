@@ -4,7 +4,7 @@ import re
 import time
 from pathlib import Path
 
-from ..io import load_prompt, render_prompt, request_structured
+from ..io import load_prompt, render_prompt, request_discussion_then_structured
 from ..opencode import create_session, start_server, stop_process, wait_for_health
 from ..results import read_feedback_rows
 from ..schema import LoopFinalSummary, load_contract_markdown
@@ -44,6 +44,13 @@ def _build_loop_summary_prompt(contract_markdown: str, results_markdown: str) ->
     )
 
 
+def _build_loop_finalize_prompt() -> str:
+    return (
+        "Based on the discussion so far, return only the final structured loop summary. "
+        "Do not include prose outside the structured result."
+    )
+
+
 def _generate_final_summary(
     *,
     cwd: Path,
@@ -66,14 +73,18 @@ def _generate_final_summary(
         session_id = session.get("id") or session.get("session", {}).get("id")
         if not isinstance(session_id, str) or not session_id:
             raise RuntimeError(f"failed to extract session id from response: {session}")
-        summary = request_structured(
+        summary = request_discussion_then_structured(
             base_url=base_url,
             session_id=session_id,
-            prompt=_build_loop_summary_prompt(contract_markdown, results_markdown),
+            discussion_prompt=_build_loop_summary_prompt(
+                contract_markdown, results_markdown
+            ),
+            finalize_prompt=_build_loop_finalize_prompt(),
             model_type=LoopFinalSummary,
             model=model,
             verbose=verbose,
-            status_hint="Summarizing loop outcome...",
+            discussion_status_hint="Summarizing loop outcome...",
+            finalize_status_hint="Structuring loop summary...",
         )
         return summary.summary
     finally:
@@ -131,7 +142,8 @@ def run(
             verbose=verbose,
         )
         if feedback.get("status") == "running":
-            sleep_sec = int(feedback.get("suggested_sleep_sec", 300))
+            sleep_raw = feedback.get("suggested_sleep_sec", 300)
+            sleep_sec = int(sleep_raw) if isinstance(sleep_raw, (int, str)) else 300
             exp_id = feedback.get("exp_id", "?")
             emit(f"[exp{exp_id}] feedback wait: checking again in {sleep_sec}s")
             time.sleep(sleep_sec)
@@ -180,7 +192,8 @@ def run(
             verbose=verbose,
         )
         if research.get("status") in {"launched", "waiting"}:
-            sleep_sec = int(research.get("polling_interval_seconds", 300))
+            sleep_raw = research.get("polling_interval_seconds", 300)
+            sleep_sec = int(sleep_raw) if isinstance(sleep_raw, (int, str)) else 300
             exp_id = research.get("exp_id", "?")
             if research.get("status") == "launched":
                 plan = research.get("plan")

@@ -4,6 +4,18 @@ ARH is a small CLI for autoresearch-style deep learning iteration.
 
 ## Install
 
+From PyPI:
+
+```bash
+uv tool install arh-oc
+```
+
+Then run the CLI as:
+
+```bash
+arh --help
+```
+
 From this repo:
 
 ```bash

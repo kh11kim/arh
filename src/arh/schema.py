@@ -13,14 +13,77 @@ DEFAULT_RESEARCH_MD = "research.md"
 def sanitize_model_text(value: Any) -> str:
     text = str(value).strip() if value is not None else ""
     text = text.replace("\r", "")
+    text = re.sub(r"<system-reminder>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(
         r"<system-reminder>.*?</system-reminder>",
         "",
         text,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    lines = [line.rstrip() for line in text.splitlines()]
+    text = re.sub(r"<system-reminder>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(
+        r"your operational mode has changed.*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"you are no longer in read-only mode.*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"you are permitted to make file changes.*$",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    blocked_line_fragments = (
+        "<system-reminder>",
+        "</system-reminder>",
+        "your operational mode has changed",
+        "you are no longer in read-only mode",
+        "you are permitted to make file changes",
+    )
+    lines = [
+        line.rstrip()
+        for line in text.splitlines()
+        if not any(fragment in line.lower() for fragment in blocked_line_fragments)
+    ]
     return "\n".join(line for line in lines if line.strip()).strip()
+
+
+def is_meta_text(value: str) -> bool:
+    text = sanitize_model_text(value).lower()
+    if not text:
+        return False
+    blocked_fragments = (
+        "<system-reminder>",
+        "</system-reminder>",
+        "latest user response:",
+        "current inspection json:",
+        "confirmed inspection json:",
+        "current contract markdown:",
+        "reply `confirm`",
+        "type `confirm`",
+        "if something is ambiguous",
+        "your job:",
+        "rules:",
+    )
+    return any(fragment in text for fragment in blocked_fragments)
+
+
+def sanitize_model_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned: list[str] = []
+    for item in value:
+        text = sanitize_model_text(item)
+        if not text or is_meta_text(text):
+            continue
+        cleaned.append(text)
+    return cleaned
 
 
 class Evaluation(BaseModel):
@@ -99,11 +162,7 @@ class ContractState(BaseModel):
     )
     @classmethod
     def _normalize_list(cls, value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [
-            sanitize_model_text(item) for item in value if sanitize_model_text(item)
-        ]
+        return sanitize_model_list(value)
 
     def as_prompt_json(self) -> str:
         return self.model_dump_json(indent=2)
@@ -176,11 +235,7 @@ class SmokeInspection(BaseModel):
     )
     @classmethod
     def _normalize_list(cls, value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [
-            sanitize_model_text(item) for item in value if sanitize_model_text(item)
-        ]
+        return sanitize_model_list(value)
 
     @model_validator(mode="after")
     def _enforce_confirmation_gate(self) -> "SmokeInspection":
@@ -209,6 +264,64 @@ class SmokeInspection(BaseModel):
             if not self.next_question or "confirm" in self.next_question.lower():
                 self.next_question = (
                     "Please clarify the single most important missing setup detail."
+                )
+        else:
+            self.next_question = (
+                sanitize_model_text(self.next_question)
+                or "Reply `confirm` or provide edits."
+            )
+        if self.next_question and "<system-reminder>" in self.next_question.lower():
+            self.next_question = "Reply `confirm` or provide edits."
+        return self
+
+
+class SetupPreparation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preparation_summary: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    smoke_command: str = ""
+    patch_plan: str = ""
+    missing_fields: list[str] = Field(default_factory=list)
+    ready_for_confirmation: bool = False
+    next_question: str = "Please confirm or provide edits."
+
+    @field_validator(
+        "preparation_summary",
+        "smoke_command",
+        "patch_plan",
+        "next_question",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_scalar(cls, value: Any) -> str:
+        return sanitize_model_text(value)
+
+    @field_validator("changed_files", "missing_fields", mode="before")
+    @classmethod
+    def _normalize_list(cls, value: Any) -> list[str]:
+        return sanitize_model_list(value)
+
+    @model_validator(mode="after")
+    def _enforce_confirmation_gate(self) -> "SetupPreparation":
+        if not self.preparation_summary and self.patch_plan:
+            self.preparation_summary = self.patch_plan.split(";", 1)[0].strip()
+        missing = []
+        if not self.preparation_summary:
+            missing.append("preparation_summary")
+        if not self.changed_files:
+            missing.append("changed_files")
+        if not self.smoke_command:
+            missing.append("smoke_command")
+        if not self.patch_plan:
+            missing.append("patch_plan")
+        self.missing_fields = missing
+        if missing:
+            self.ready_for_confirmation = False
+            self.next_question = sanitize_model_text(self.next_question)
+            if not self.next_question or "confirm" in self.next_question.lower():
+                self.next_question = (
+                    "Please clarify the single most important smoke preparation detail."
                 )
         else:
             self.next_question = (
@@ -250,11 +363,7 @@ class SetupPatchResult(BaseModel):
     @field_validator("changed_files", mode="before")
     @classmethod
     def _normalize_changed_files(cls, value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [
-            sanitize_model_text(item) for item in value if sanitize_model_text(item)
-        ]
+        return sanitize_model_list(value)
 
 
 class ResearchPlan(BaseModel):

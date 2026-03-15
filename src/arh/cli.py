@@ -5,6 +5,11 @@ from pathlib import Path
 
 import typer
 
+try:
+    import readline  # noqa: F401
+except ImportError:
+    readline = None
+
 from . import __version__
 from .core import run_opencode_smoke
 from .phases import contract as contract_phase
@@ -96,8 +101,9 @@ def setup(
     print(f"session_id: {result['session_id']}")
     if "smoke_result" in result:
         smoke_result = result["smoke_result"]
-        print(f"log_path: {smoke_result['log_path']}")
-        print(f"command: {smoke_result['command']}")
+        if smoke_result:
+            print(f"log_path: {smoke_result['log_path']}")
+            print(f"command: {smoke_result['command']}")
     if "result_marker" in result and result["result_marker"]:
         print(f"result: {result['result_marker']}")
     if "git" in result:

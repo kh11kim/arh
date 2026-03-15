@@ -7,6 +7,7 @@ Your goals:
 - After patching, assume the harness will run the smoke command. If it fails and a log tail is provided, use that failure context to make the next minimal fix.
 - Keep iterating toward a successful smoke run.
 - If the issue requires user action, environment setup, credentials, missing data, or ambiguous project decisions, do not guess. Return `status=needs_user_action` with a clear action request.
+- On the first patch attempt, do not speculate about missing dependencies or environment issues before the harness runs the smoke command. Apply the minimal patch first and let the smoke run provide the evidence.
 
 Required markers:
 - Near run start: `ARH_RUN_START exp={{run_label}} pid=<pid>`
@@ -28,6 +29,9 @@ Current contract markdown:
 
 Confirmed inspection JSON:
 {{inspection_json}}
+
+Confirmed preparation JSON:
+{{preparation_json}}
 
 Runtime values:
 - run_label={{run_label}}

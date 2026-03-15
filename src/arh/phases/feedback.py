@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ..io import load_prompt, render_prompt, request_structured
+from ..io import load_prompt, render_prompt, request_discussion_then_structured
 from ..opencode import create_session, start_server, stop_process, wait_for_health
 from ..results import (
     append_feedback_row,
@@ -70,6 +70,13 @@ def build_feedback_prompt(
         research_row_json=json.dumps(research_row, ensure_ascii=False, indent=2),
         log_tail=log_tail or "(none)",
         result_marker_json=json.dumps(result_marker, ensure_ascii=False, indent=2),
+    )
+
+
+def build_finalize_prompt() -> str:
+    return (
+        "Based on the discussion so far, return only the final structured feedback summary. "
+        "Do not ask follow-up questions. Do not include prose outside the structured result."
     )
 
 
@@ -141,20 +148,22 @@ def run(
         if not isinstance(session_id, str) or not session_id:
             raise RuntimeError(f"failed to extract session id from response: {session}")
 
-        summary = request_structured(
+        summary = request_discussion_then_structured(
             base_url=base_url,
             session_id=session_id,
-            prompt=build_feedback_prompt(
+            discussion_prompt=build_feedback_prompt(
                 contract_markdown,
                 results_markdown,
                 research_row,
                 log_tail,
                 result_marker,
             ),
+            finalize_prompt=build_finalize_prompt(),
             model_type=FeedbackSummary,
             model=model,
             verbose=verbose,
-            status_hint="Summarizing experiment feedback...",
+            discussion_status_hint="Summarizing experiment feedback...",
+            finalize_status_hint="Structuring experiment feedback...",
         )
 
         append_feedback_row(

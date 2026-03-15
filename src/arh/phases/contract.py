@@ -4,28 +4,30 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ..io import load_prompt, render_prompt, request_structured
+from .. import io
 from ..opencode import create_session, start_server, stop_process, wait_for_health
 from ..schema import ContractState, DEFAULT_RESEARCH_MD, empty_contract_state
 
 
 def sanitize_user_input(text: str) -> str:
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", cleaned)
     return cleaned.strip()
 
 
-def build_contract_prompt(
-    user_message: str,
-    current_state: ContractState,
-    turn_index: int,
+def build_contract_discussion_prompt(
+    user_message: str, current_state: ContractState
 ) -> str:
-    template = load_prompt("contract.md")
-    return render_prompt(
+    template = io.load_prompt("contract_discussion.md")
+    return io.render_prompt(
         template,
-        turn_index=str(turn_index),
         current_state_json=current_state.as_prompt_json(),
         user_message=user_message.strip(),
     )
+
+
+def build_contract_finalize_prompt() -> str:
+    return io.load_prompt("contract_finalize.md")
 
 
 def render_research_markdown(state: ContractState) -> str:
@@ -84,24 +86,52 @@ def print_contract_state(state: ContractState) -> None:
     print()
 
 
+def should_preview_contract_state(reply: str) -> bool:
+    text = reply.lower()
+    markers = (
+        "confirm",
+        "검토 상태",
+        "계약이 거의 완성",
+        "계약 수집이 완료",
+        "provide edits",
+        "수정할 항목",
+    )
+    return any(marker in text for marker in markers)
+
+
 def request_contract_turn(
     base_url: str,
     session_id: str,
     user_message: str,
     current_state: ContractState,
-    turn_index: int,
     model: str | None,
     verbose: bool,
-) -> ContractState:
-    prompt = build_contract_prompt(user_message, current_state, turn_index)
-    return request_structured(
+) -> str:
+    prompt = build_contract_discussion_prompt(user_message, current_state)
+    return io.request_text(
         base_url=base_url,
         session_id=session_id,
         prompt=prompt,
+        model=model,
+        verbose=verbose,
+        status_hint="Discussing research contract...",
+    )
+
+
+def finalize_contract(
+    base_url: str,
+    session_id: str,
+    model: str | None,
+    verbose: bool,
+) -> ContractState:
+    return io.request_structured(
+        base_url=base_url,
+        session_id=session_id,
+        prompt=build_contract_finalize_prompt(),
         model_type=ContractState,
         model=model,
         verbose=verbose,
-        status_hint="Updating research contract...",
+        status_hint="Finalizing research contract...",
     )
 
 
@@ -126,7 +156,6 @@ def run(
 
         print_contract_intro()
 
-        current_state = empty_contract_state()
         try:
             user_message = sanitize_user_input(input("> "))
         except EOFError:
@@ -139,21 +168,31 @@ def run(
                 "base_url": base_url,
             }
 
-        turn_index = 1
+        current_state = empty_contract_state()
         while True:
-            current_state = request_contract_turn(
+            reply = request_contract_turn(
                 base_url=base_url,
                 session_id=session_id,
                 user_message=user_message,
                 current_state=current_state,
-                turn_index=turn_index,
                 model=model,
                 verbose=verbose,
             )
-            turn_index += 1
-
-            print_contract_state(current_state)
-            print(current_state.next_question)
+            if should_preview_contract_state(reply):
+                try:
+                    current_state = finalize_contract(
+                        base_url=base_url,
+                        session_id=session_id,
+                        model=model,
+                        verbose=verbose,
+                    )
+                except io.StructuredResponseError:
+                    print(reply)
+                else:
+                    print_contract_state(current_state)
+                    print("Reply `confirm` to save this contract, or provide edits.")
+            else:
+                print(reply)
 
             try:
                 user_input = sanitize_user_input(input("> "))
@@ -170,18 +209,39 @@ def run(
                     "state": current_state,
                 }
 
-            if current_state.ready_for_review and user_input.lower() == "confirm":
-                target = cwd / output_path
-                draft = render_research_markdown(current_state)
-                target.write_text(draft + "\n", encoding="utf-8")
-                return {
-                    "status": "saved",
-                    "session_id": session_id,
-                    "base_url": base_url,
-                    "output_path": str(target),
-                    "draft": draft,
-                    "state": current_state,
-                }
+            if user_input.lower() == "confirm":
+                current_state = finalize_contract(
+                    base_url=base_url,
+                    session_id=session_id,
+                    model=model,
+                    verbose=verbose,
+                )
+                print_contract_state(current_state)
+                if current_state.ready_for_review:
+                    target = cwd / output_path
+                    draft = render_research_markdown(current_state)
+                    target.write_text(draft + "\n", encoding="utf-8")
+                    return {
+                        "status": "saved",
+                        "session_id": session_id,
+                        "base_url": base_url,
+                        "output_path": str(target),
+                        "draft": draft,
+                        "state": current_state,
+                    }
+                print(current_state.next_question)
+                try:
+                    user_message = sanitize_user_input(input("> "))
+                except EOFError:
+                    user_message = "quit"
+                if not user_message or user_message.lower() == "quit":
+                    return {
+                        "status": "cancelled",
+                        "session_id": session_id,
+                        "base_url": base_url,
+                        "state": current_state,
+                    }
+                continue
 
             user_message = user_input
     finally:
